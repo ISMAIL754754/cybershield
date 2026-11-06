@@ -1,0 +1,128 @@
+name: cybershield
+
+x-spark-worker: &spark-worker
+  image: ${SPARK_IMAGE}
+  depends_on: [spark-master]
+  environment:
+    SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+    SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+  networks: [cybershield-net]
+
+services:
+  # ---------- Stockage : HDFS (1 NameNode + 2 DataNodes, réplication 2) ----------
+  namenode:
+    image: bde2020/hadoop-namenode:${HADOOP_IMAGE_TAG}
+    container_name: namenode
+    environment:
+      CLUSTER_NAME: cybershield
+    env_file: [infra/hadoop/hadoop.env]
+    ports: ["9870:9870", "9000:9000"]
+    volumes: [namenode-data:/hadoop/dfs/name]
+    networks: [cybershield-net]
+
+  datanode1:
+    image: bde2020/hadoop-datanode:${HADOOP_IMAGE_TAG}
+    container_name: datanode1
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file: [infra/hadoop/hadoop.env]
+    volumes: [datanode1-data:/hadoop/dfs/data]
+    depends_on: [namenode]
+    networks: [cybershield-net]
+
+  datanode2:
+    image: bde2020/hadoop-datanode:${HADOOP_IMAGE_TAG}
+    container_name: datanode2
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file: [infra/hadoop/hadoop.env]
+    volumes: [datanode2-data:/hadoop/dfs/data]
+    depends_on: [namenode]
+    networks: [cybershield-net]
+
+  # ---------- Calcul : Spark standalone (1 master + 2 workers) ----------
+  spark-master:
+    image: ${SPARK_IMAGE}
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+    ports: ["8080:8080", "7077:7077"]
+    volumes:
+      - ./ingestion:/opt/cybershield/ingestion:ro
+      - ./batch:/opt/cybershield/batch
+      - ./streaming:/opt/cybershield/streaming
+    networks: [cybershield-net]
+
+  spark-worker-1:
+    <<: *spark-worker
+    container_name: spark-worker-1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8081
+    ports: ["8081:8081"]
+
+  spark-worker-2:
+    <<: *spark-worker
+    container_name: spark-worker-2
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8082
+    ports: ["8082:8082"]
+
+  # ---------- Ingestion : Kafka (KRaft, sans Zookeeper) ----------
+  kafka:
+    image: ${KAFKA_IMAGE}
+    container_name: kafka
+    ports: ["9094:9094"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes: [kafka-data:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+    networks: [cybershield-net]
+
+  kafka-init:
+    image: ${KAFKA_IMAGE}
+    container_name: kafka-init
+    depends_on:
+      kafka: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists
+        --topic ${KAFKA_TOPIC} --partitions ${KAFKA_PARTITIONS} --replication-factor 1
+    restart: "no"
+    networks: [cybershield-net]
+
+  # ---------- Producteur : rejoue CICIDS2017 vers Kafka (profil "producer") ----------
+  producer:
+    build: ./ingestion
+    container_name: producer
+    profiles: ["producer"]
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      DATASET_DIR: ${DATASET_DIR}
+      PRODUCER_RATE: ${PRODUCER_RATE}
+    volumes: ["./data:/data:ro"]
+    networks: [cybershield-net]
+
+networks:
+  cybershield-net:
+    name: cybershield-net
+
+volumes:
+  namenode-data:
+  datanode1-data:
+  datanode2-data:
+  kafka-data:
